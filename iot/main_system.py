@@ -1,0 +1,447 @@
+import cv2
+import boto3
+import os
+import requests # API 통신을 위한 라이브러리
+import json # JSON 데이터를 파싱하기 위한 라이브러리
+import atexit
+import signal
+import sys
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from ultralytics import YOLO
+import paho.mqtt.client as mqtt
+from threading import Timer
+from dotenv import load_dotenv # env 파일을 읽어오기 위한 라이브러리
+
+# ----------------------------------------------------
+# [1. 글로벌 변수 및 네트워크 설정]
+# ----------------------------------------------------
+# .env 파일에서 환경 변수 불러오기
+load_dotenv() 
+
+# 보안 처리된 환경 변수에서 값을 가져옵니다.
+AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY", "")
+AWS_SECRET_KEY = os.getenv("AWS_SECRET_KEY", "")
+AWS_REGION = "ap-northeast-2" # 예: 서울 리전
+BUCKET_NAME = os.getenv("AWS_S3_BUCKET", "new-ejo-bucket")
+
+# Tapo C200 IP 카메라 RTSP 주소 (.env 의 RTSP_URL 에 설정)
+CAM_URL = os.getenv("RTSP_URL", "")
+
+# 백엔드 실제 API 주소 반영
+BASE_URL = os.getenv("IOT_BACKEND_BASE_URL", "http://13.209.33.104:8080")
+FASTAPI_SQUATTING_URL = f"{BASE_URL}/api/seat/squatting"
+FASTAPI_LOST_ITEM_URL = f"{BASE_URL}/api/seat/lost-item"
+FASTAPI_POSTURE_URL = f"{BASE_URL}/api/seat/posture"
+FASTAPI_STATUS_URL = f"{BASE_URL}/api/seat/status"
+FASTAPI_CHECKIN_STATUS_URL = f"{BASE_URL}/api/seat/check-in-status"
+FASTAPI_RESET_DEMO_URL = f"{BASE_URL}/api/testing/reset-demo-state"
+MQTT_BROKER_HOST = os.getenv("MQTT_BROKER", "localhost")
+MQTT_BROKER_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+IOT_API_KEY = os.getenv("IOT_API_KEY", "local-iot-key")
+IOT_ADMIN_PORT = int(os.getenv("IOT_ADMIN_PORT", "8090"))
+
+# S3 클라이언트 초기화
+s3_client = boto3.client(
+    's3',
+    aws_access_key_id=AWS_ACCESS_KEY,
+    aws_secret_access_key=AWS_SECRET_KEY,
+    region_name=AWS_REGION
+)
+
+squatting_timers = {}
+shutdown_started = False
+# ⚠️ 현재 테스트를 위해 10초로 변경 (관리자가 변경하면 이 값이 업데이트 됨)
+SQUATTING_LIMIT = 10  
+
+
+def fetch_checkin_status(seat_num):
+    try:
+        response = requests.get(f"{FASTAPI_CHECKIN_STATUS_URL}/{seat_num}", timeout=2)
+        if response.status_code == 200:
+            return response.json().get("is_checked_in", False)
+        print(f"[API] Check-in status request failed for Seat {seat_num}. HTTP Code: {response.status_code}")
+    except requests.exceptions.RequestException as exc:
+        print(f"[API] Check-in status request failed for Seat {seat_num}: {exc}")
+    return False
+  
+# ----------------------------------------------------
+# [2. 사석화 판정 로직]
+# ----------------------------------------------------
+def trigger_squatting(seat_num):
+    if not fetch_checkin_status(seat_num):
+        print(f"[INFO] Seat {seat_num} is no longer checked in. Skipping squatting mark.")
+        squatting_timers.pop(seat_num, None)
+        return
+
+    print(f"[WARNING] Seat {seat_num} empty for timer limit! Marked as squatting.")
+    try:
+        payload = {"seat_num": seat_num, "status": "squatting"}
+        response = requests.post(FASTAPI_SQUATTING_URL, json=payload)
+        if response.status_code == 200:
+            print(f"[SUCCESS] Squatting status for Seat {seat_num} sent!")
+        else:
+            print(f"[ERROR] Failed to send status. HTTP Code: {response.status_code}")
+    except Exception as e:
+        print(f"[ERROR] Cannot connect to main server: {e}")
+
+
+def send_empty_status(seat_num):
+    current_time_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    payload = {
+        "seat_num": seat_num,
+        "pressure": 0,
+        "timestamp": current_time_iso
+    }
+    try:
+        response = requests.post(FASTAPI_STATUS_URL, json=payload)
+        if response.status_code == 200:
+            print(f"[SUCCESS] Empty status sent! (Seat {seat_num})")
+        else:
+            print(f"[ERROR] Empty status API failed. HTTP Code: {response.status_code}, Response: {response.text}")
+    except Exception as e:
+        print(f"[ERROR] Failed to connect to server for empty status API: {e}")
+
+
+def cancel_all_squatting_timers():
+    for seat_num, timer in list(squatting_timers.items()):
+        print(f"[TIMER] Canceling squatting timer for seat {seat_num}.")
+        timer.cancel()
+        del squatting_timers[seat_num]
+
+
+def reset_demo_state(reason):
+    print(f"[TEST] Resetting demo state ({reason})...")
+    cancel_all_squatting_timers()
+    try:
+        response = requests.post(FASTAPI_RESET_DEMO_URL, timeout=3)
+        if response.status_code == 200:
+            print("[SUCCESS] Demo state reset completed.")
+        else:
+            print(f"[ERROR] Demo state reset failed. HTTP Code: {response.status_code}, Response: {response.text}")
+    except Exception as e:
+        print(f"[ERROR] Failed to reset demo state: {e}")
+
+
+def handle_shutdown(signum=None, frame=None):
+    global shutdown_started
+
+    if shutdown_started:
+        return
+    shutdown_started = True
+
+    signal_name = "process exit" if signum is None else signal.Signals(signum).name
+    reset_demo_state(f"iot shutdown: {signal_name}")
+
+    if signum is not None:
+        sys.exit(0)
+
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print(f"[MQTT] Connected to broker {MQTT_BROKER_HOST}:{MQTT_BROKER_PORT}")
+        client.subscribe("seat/status/#")
+        client.subscribe("admin/trigger_lost_item")
+        client.subscribe("admin/config/squatting_time")
+        print("[MQTT] Subscribed to seat/status/#, admin/trigger_lost_item, admin/config/squatting_time")
+    else:
+        print(f"[MQTT] Connection failed with result code {rc}")
+
+
+class AdminTriggerHandler(BaseHTTPRequestHandler):
+
+    def do_POST(self):
+        if self.path != "/admin/lost-item-scan":
+            self.send_error(404)
+            return
+
+        provided_api_key = self.headers.get("X-IoT-Api-Key", "")
+        if IOT_API_KEY and provided_api_key != IOT_API_KEY:
+            self.send_error(403)
+            return
+
+        content_length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(content_length) if content_length > 0 else b"{}"
+
+        try:
+            payload = json.loads(raw_body.decode("utf-8"))
+        except json.JSONDecodeError:
+            self.send_error(400, "Invalid JSON payload")
+            return
+
+        command = payload.get("command", "detect")
+        if command != "detect":
+            self.send_error(400, "Unsupported command")
+            return
+
+        threading.Thread(target=check_lost_items, daemon=True).start()
+        response_body = json.dumps({"message": "lost item scan accepted"}).encode("utf-8")
+
+        self.send_response(202)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def log_message(self, format, *args):
+        print(f"[IOT-HTTP] {self.address_string()} - {format % args}")
+
+
+def start_admin_trigger_server():
+    server = ThreadingHTTPServer(("0.0.0.0", IOT_ADMIN_PORT), AdminTriggerHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"[IOT-HTTP] Admin trigger server listening on 0.0.0.0:{IOT_ADMIN_PORT}")
+    return server
+
+# ----------------------------------------------------
+# [3. 분실물 탐지 및 개별 크롭(Crop) 업로드 로직]
+# ----------------------------------------------------
+def check_lost_items():
+    print("[CAMERA] Admin trigger received: Starting CCTV multi-seat scan!")
+    
+    try:
+        # 1. YOLO 모델 로드
+        print("[YOLO] Loading model 'best_v5.pt'...")
+        model = YOLO('best_v5.pt')
+        
+        # 2. 웹캠 사진 촬영
+        print(f"[CAMERA] Connecting to RTSP stream: {CAM_URL}...")
+        cap = cv2.VideoCapture(CAM_URL)
+        ret, frame = cap.read()
+        
+        # 카메라 화면의 가로, 세로 너비 모두 가져오기
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release() 
+        
+        if not ret:
+            print("[ERROR] Failed to capture image from RTSP stream.")
+            return
+
+        # 3. 객체 탐지 수행 (원본 frame에서 탐지)
+        print("[YOLO] Running object detection on full CCTV view...")
+        results = model(frame)
+        
+        # 3-1. 객체 추출 및 좌표, 종류 임시 저장
+        detected_items_with_seats = []
+        
+        # 찾고자 하는 타겟 분실물 10가지 클래스
+        TARGET_CLASSES = ["backpack", "book", "card", "glasses", "laptop", "mouse", "phone", "tumbler", "bottle", "charger"]
+        
+        for box in results[0].boxes:
+            # 카테고리 이름 추출
+            class_id = int(box.cls[0])
+            category = results[0].names[class_id]
+            
+            # 탐지된 물건이 타겟 리스트에 없으면 크롭/저장 안 하고 건너뛰
+            if category.lower() not in TARGET_CLASSES:
+                continue
+            
+            # 바운딩 박스의 중심 x, y 좌표 모두 계산
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            x_center = (x1 + x2) / 2 # 물체의 중심 x 좌표
+            y_center = (y1 + y2) / 2 # 물체의 중심 y 좌표
+            
+            # 화면을 십자(2x2)로 나누어 좌석 번호 맵핑
+            if x_center < (frame_width / 2):
+                # 화면의 왼쪽 절반
+                if y_center < (frame_height / 2):
+                    detected_seat = 1 # 왼쪽 위
+                else:
+                    detected_seat = 2 # 왼쪽 아래
+            else:
+                # 화면의 오른쪽 절반
+                if y_center < (frame_height / 2):
+                    detected_seat = 4 # 오른쪽 위
+                else:
+                    detected_seat = 3 # 오른쪽 아래
+                
+            detected_items_with_seats.append({
+                "seat_num": detected_seat,
+                "category": category,
+                "bbox": (x1, y1, x2, y2) # 자르기 위한 좌표 저장
+            })
+            
+        # 중복 제거 (예: 1번 자리에 책이 2권 있어도 1번만 전송)
+        unique_items = []
+        seen = set()
+        for item in detected_items_with_seats:
+            identifier = f"{item['seat_num']}_{item['category']}"
+            if identifier not in seen:
+                seen.add(identifier)
+                unique_items.append(item)
+                
+        print(f"[YOLO] Unique Mapped Items: {[f'Seat {i['seat_num']}: {i['category']}' for i in unique_items]}")
+
+        # 탐지된 타겟 물건이 없으면 여기서 바로 종료
+        if not unique_items:
+            print("[YOLO] ✨ No target items detected. Skipping S3 upload and API call.")
+            return 
+
+        # 4. 개별 이미지 크롭, S3 업로드 및 API 전송
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        print(f"[API] Processing and sending lost item data to server one by one...")
+        
+        for item in unique_items:
+            # 4-1. 원본 이미지에서 해당 물건 영역만 크롭 (y좌표 먼저, x좌표 나중)
+            x1, y1, x2, y2 = item["bbox"]
+            cropped_img = frame[y1:y2, x1:x2]
+            
+            # 4-2. 개별 파일로 로컬에 저장
+            local_filename = f"lost_item_seat{item['seat_num']}_{item['category']}_{timestamp}.jpg"
+            cv2.imwrite(local_filename, cropped_img)
+            print(f"[LOCAL STORAGE] Cropped image saved: {local_filename}")
+            
+            # 4-3. S3에 개별 업로드
+            s3_key = f"lost_items/{local_filename}"
+            s3_client.upload_file(
+                local_filename, BUCKET_NAME, s3_key,
+                ExtraArgs={'ContentType': 'image/jpeg'}
+            )
+            
+            # 4-4. 백엔드로 개별 S3 key 전송
+            lost_item_payload = {
+                "seat_num": item["seat_num"], 
+                "image_url": s3_key,
+                "category": item["category"]  
+            }
+            
+            api_response = requests.post(FASTAPI_LOST_ITEM_URL, json=lost_item_payload)
+            
+            if api_response.status_code == 200:
+                 print(f"[SUCCESS] Sent S3 key for Seat {item['seat_num']} -> {item['category']}")
+            else:
+                 print(f"[ERROR] Failed to send {item['category']}. HTTP Code: {api_response.status_code}")
+        
+    except Exception as e:
+        print(f"[ERROR] Exception occurred: {e}")
+        
+    finally:
+        # 5. 메모리 강제 해제
+        if 'model' in locals():
+            del model
+            print("[CLEANUP] YOLO model unloaded.")
+
+# ----------------------------------------------------
+# [4. MQTT 이벤트 수신 및 라우팅 로직]
+# ----------------------------------------------------
+def on_message(client, userdata, msg):
+    global SQUATTING_LIMIT 
+    
+    topic = msg.topic
+    payload_str = msg.payload.decode("utf-8").strip()
+    
+    if topic.startswith("seat/status/"):
+        seat_num = int(topic.split("/")[-1])
+        
+        try:
+            # ESP32가 보낸 JSON 문자열을 파이썬 딕셔너리로 변환
+            data = json.loads(payload_str)
+            
+            # [상태 B] 사람이 일어난 경우 (status: 0 이 넘어옴)
+            if "status" in data and data["status"] == 0:
+                print(f"[Seat {seat_num}] Empty seat detected. Checking app status...")
+                send_empty_status(seat_num)
+                
+                # 백엔드에 현재 발권(체크인) 상태인지 물어보는 검증 로직
+                is_checked_in = fetch_checkin_status(seat_num)
+                
+                # 체크인 상태일 때만 사석화 타이머 가동
+                if is_checked_in:
+                    print(f"[Seat {seat_num}] User is still checked in! Starting squatting timer ({SQUATTING_LIMIT}s)...")
+                    if seat_num not in squatting_timers:
+                        timer = Timer(SQUATTING_LIMIT, trigger_squatting, args=[seat_num])
+                        timer.start()
+                        squatting_timers[seat_num] = timer
+                else:
+                    print(f"[INFO] ✨ Seat {seat_num} user checked out properly. No squatting timer started.")
+            
+            # [상태 A] 사람이 앉아 있는 경우 (posture, left, right, back 데이터가 넘어옴)
+            else:
+                posture = data.get("posture", "정상")
+                left_val = data.get("left", 0)
+                right_val = data.get("right", 0)
+                back_val = data.get("back", 0)
+                
+                print(f"[Seat {seat_num}] Occupied. Posture: {posture} (L:{left_val}, R:{right_val}, B:{back_val})")
+                
+                # 사람이 돌아왔으니 사석화 타이머 취소
+                if seat_num in squatting_timers:
+                    print(f"[TIMER] Seat {seat_num} user returned. Timer canceled.")
+                    squatting_timers[seat_num].cancel()
+                    del squatting_timers[seat_num]
+                
+                # timestamp 생성 (UTC 기준 ISO 8601 포맷)
+                current_time_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+                # 라즈베리 파이가 메인 서버(백엔드)로 헬스케어 데이터 전송
+                posture_payload = {
+                    "seat_num": seat_num,
+                    "posture": posture,
+                    "left_pressure": data.get("left", 0),
+                    "right_pressure": data.get("right", 0),
+                    "back_pressure": data.get("back", 0),
+                    "timestamp": current_time_iso 
+                }
+                try:
+                    # 응답 결과를 response 변수에 담기
+                    response = requests.post(FASTAPI_POSTURE_URL, json=posture_payload)
+                    
+                    # HTTP 상태 코드가 200번대(성공)일 때만 성공 로그 출력
+                    if response.status_code == 200 or response.status_code == 201:
+                        print(f"[SUCCESS] Posture data sent! (Seat {seat_num})")
+                    else:
+                        print(f"[ERROR] Posture API failed. HTTP Code: {response.status_code}, Response: {response.text}")
+                        
+                except Exception as e:
+                    print(f"[ERROR] Failed to connect to server for posture API: {e}")
+
+        except json.JSONDecodeError:
+            # JSON 형식이 깨지거나 알 수 없는 데이터가 들어와도 서버가 꺼지지 않도록 방어
+            print(f"[ERROR] Invalid JSON data received: {payload_str}")
+
+    # [수동 트리거] 관리자가 분실물 스캔 버튼을 눌렀을 때
+    elif topic == "admin/trigger_lost_item":
+        # CCTV가 전 좌석을 확인하므로 특정 좌석 번호 없이 전체 스캔 함수 호출
+        check_lost_items()
+
+    # [동적 타이머 설정] 관리자가 사석화 기준 시간을 변경했을 때
+    elif topic == "admin/config/squatting_time":
+        try:
+            # 관리자가 앱에서 보낸 JSON (예: {"limit_minutes": 60} 또는 {"limit_seconds": 10})
+            config_data = json.loads(payload_str)
+            if "limit_seconds" in config_data:
+                SQUATTING_LIMIT = int(config_data["limit_seconds"])
+                print(f"[CONFIG] 🛠️ Admin updated squatting limit to {SQUATTING_LIMIT} seconds (test mode)!")
+            else:
+                new_minutes = config_data.get("limit_minutes", 45) # 기본값은 45분
+                SQUATTING_LIMIT = new_minutes * 60
+                print(f"[CONFIG] 🛠️ Admin updated squatting limit to {new_minutes} minutes ({SQUATTING_LIMIT} seconds)!")
+        except Exception as e:
+            print(f"[ERROR] Failed to update squatting time: {e}")
+
+# ----------------------------------------------------
+# [5. 메인 실행]
+# ----------------------------------------------------
+if __name__ == "__main__":
+    atexit.register(handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    admin_trigger_server = start_admin_trigger_server()
+
+    # 버전 명시 추가 (DeprecationWarning 경고 제거)
+    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION1)
+    if MQTT_USERNAME:
+        client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
+    client.on_connect = on_connect
+    client.on_message = on_message
+    client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT)
+
+    print("🚀 Edge Server Ready. Listening for events...")
+    client.loop_forever()
